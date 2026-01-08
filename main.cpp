@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -151,6 +152,25 @@ static std::optional<std::string> extractStreamDeltaContent(const std::string& j
   return parseJsonStringAt(json, i);
 }
 
+static std::optional<std::string> extractStreamDeltaReasoning(const std::string& json) {
+  // Typical chunk:
+  // {"choices":[{"delta":{"reasoning":"thinking..."},"index":0,"finish_reason":null}]}
+  size_t d = json.find("\"delta\"");
+  if (d == std::string::npos) return std::nullopt;
+
+  size_t r = json.find("\"reasoning\"", d);
+  if (r == std::string::npos) return std::nullopt;
+
+  size_t colon = json.find(':', r);
+  if (colon == std::string::npos) return std::nullopt;
+
+  size_t i = colon + 1;
+  while (i < json.size() && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) i++;
+
+  if (i >= json.size() || json[i] != '"') return std::nullopt;
+  return parseJsonStringAt(json, i);
+}
+
 // ------------------------- ANSI + streaming markdown-ish printer -------------------------
 
 struct Ansi {
@@ -162,6 +182,96 @@ struct Ansi {
   std::string yellow() const { return enable ? "\x1b[33m" : ""; }
   std::string green() const { return enable ? "\x1b[32m" : ""; }
   std::string gray() const { return enable ? "\x1b[90m" : ""; }
+};
+
+struct ReasoningWindow {
+  size_t width{20};
+  size_t height{3};
+  bool render{false};
+  bool printed{false};
+  std::deque<std::string> lines;
+  std::string current;
+
+  ReasoningWindow() = default;
+  ReasoningWindow(size_t w, size_t h) : width(w), height(h) {}
+
+  void append(const std::string& text) {
+    for (char c : text) {
+      if (c == '\r') continue;
+      if (c == '\n') {
+        pushLine();
+        continue;
+      }
+      if (current.size() >= width) pushLine();
+      current.push_back(c);
+    }
+    if (render) draw();
+  }
+
+  void reset() {
+    lines.clear();
+    current.clear();
+  }
+
+  std::vector<std::string> snapshotLines() const {
+    std::deque<std::string> all = lines;
+    if (!current.empty() || all.empty()) all.push_back(current);
+
+    std::vector<std::string> out(height, "");
+    size_t start = (all.size() > height) ? (all.size() - height) : 0;
+    size_t outIdx = height - (all.size() - start);
+    for (size_t i = start; i < all.size() && outIdx < height; i++, outIdx++) {
+      out[outIdx] = all[i];
+    }
+    return out;
+  }
+
+  void draw() {
+    std::vector<std::string> view = snapshotLines();
+    if (printed) moveCursorUp(height);
+    for (size_t i = 0; i < height; i++) {
+      clearLine();
+      std::string line = view[i];
+      if (line.size() > width) line.resize(width);
+      if (line.size() < width) line.append(width - line.size(), ' ');
+      std::cout << line;
+      if (i + 1 < height) moveDown();
+    }
+    std::cout.flush();
+    printed = true;
+  }
+
+  void clearDisplay() {
+    if (!render || !printed) return;
+    moveCursorUp(height);
+    for (size_t i = 0; i < height; i++) {
+      clearLine();
+      if (i + 1 < height) moveDown();
+    }
+    moveCursorUp(height - 1);
+    std::cout.flush();
+    printed = false;
+  }
+
+private:
+  void pushLine() {
+    lines.push_back(current);
+    current.clear();
+    while (lines.size() > height) lines.pop_front();
+  }
+
+  void moveCursorUp(size_t n) const {
+    if (n == 0) return;
+    std::cout << "\x1b[" << n << "F";
+  }
+
+  void moveDown() const {
+    std::cout << "\x1b[1E";
+  }
+
+  void clearLine() const {
+    std::cout << "\x1b[2K";
+  }
 };
 
 struct StreamingMarkdownPrinter {
@@ -529,7 +639,9 @@ struct StreamState {
   std::string rawAll;          // keep for debugging / non-2xx
   std::string assistantAll;    // accumulated assistant content
   bool sawDone{false};
+  bool responseStarted{false};
   StreamingMarkdownPrinter printer;
+  ReasoningWindow reasoningWindow;
 };
 
 static size_t sseWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -564,7 +676,18 @@ static size_t sseWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     }
 
     auto delta = extractStreamDeltaContent(payload);
+    auto reasoning = extractStreamDeltaReasoning(payload);
+
+    if (reasoning && !st->responseStarted) {
+      st->reasoningWindow.append(*reasoning);
+    }
+
     if (delta && !delta->empty()) {
+      if (!st->responseStarted) {
+        st->reasoningWindow.clearDisplay();
+        st->reasoningWindow.reset();
+        st->responseStarted = true;
+      }
       st->assistantAll += *delta;
       st->printer.write(*delta);
     }
@@ -626,6 +749,7 @@ static bool httpPostJsonStream(
 
 // ------------------------- main -------------------------
 
+#ifndef LM_TESTING
 int main(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: lm \"prompt\" [more words...]\n"
@@ -734,6 +858,7 @@ int main(int argc, char** argv) {
   st.printer.raw = raw;
   st.printer.enableColor = stdoutIsTty && !forceNoColor && !raw;
   st.printer.ansi.enable = st.printer.enableColor;
+  st.reasoningWindow.render = stdoutIsTty && !raw;
 
   long httpCode = 0;
   std::string err;
@@ -741,6 +866,9 @@ int main(int argc, char** argv) {
                                httpCode, err, st);
 
   curl_global_cleanup();
+
+  st.reasoningWindow.clearDisplay();
+  st.reasoningWindow.reset();
 
   st.printer.finalize();
 
@@ -766,4 +894,4 @@ int main(int argc, char** argv) {
 
   return 0;
 }
-
+#endif
