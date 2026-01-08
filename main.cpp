@@ -2,11 +2,15 @@
 #include <curl/curl.h>
 
 #include <cerrno>
+#include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <curses.h>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <fstream>
+#include <locale.h>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -657,6 +661,10 @@ struct StreamState {
   bool responseStarted{false};
   StreamingMarkdownPrinter printer;
   ReasoningWindow reasoningWindow;
+  bool useCallbacks{false};
+  std::function<void(const std::string&)> onReasoning;
+  std::function<void()> onContentStart;
+  std::function<void(const std::string&)> onContent;
 };
 
 static size_t sseWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -692,6 +700,22 @@ static size_t sseWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
 
     auto delta = extractStreamDeltaContent(payload);
     auto reasoning = extractStreamDeltaReasoning(payload);
+
+    if (st->useCallbacks) {
+      if (reasoning && !st->responseStarted && st->onReasoning) {
+        st->onReasoning(*reasoning);
+      }
+
+      if (delta && !delta->empty()) {
+        if (!st->responseStarted) {
+          if (st->onContentStart) st->onContentStart();
+          st->responseStarted = true;
+        }
+        st->assistantAll += *delta;
+        if (st->onContent) st->onContent(*delta);
+      }
+      continue;
+    }
 
     if (reasoning && !st->responseStarted) {
       st->reasoningWindow.append(*reasoning);
@@ -762,14 +786,393 @@ static bool httpPostJsonStream(
   return true;
 }
 
+// ------------------------- TUI helpers -------------------------
+
+static std::vector<std::string> wrapTextWords(const std::string& text, int width) {
+  std::vector<std::string> lines;
+  if (width <= 0) return lines;
+
+  std::string line;
+  std::string word;
+
+  auto flushWord = [&]() {
+    if (word.empty()) return;
+    if ((int)line.size() == 0) {
+      if ((int)word.size() <= width) {
+        line = word;
+      } else {
+        size_t i = 0;
+        while (i < word.size()) {
+          size_t take = std::min<size_t>(width, word.size() - i);
+          lines.push_back(word.substr(i, take));
+          i += take;
+        }
+      }
+    } else {
+      if ((int)(line.size() + 1 + word.size()) <= width) {
+        line += " " + word;
+      } else {
+        lines.push_back(line);
+        line.clear();
+        if ((int)word.size() <= width) {
+          line = word;
+        } else {
+          size_t i = 0;
+          while (i < word.size()) {
+            size_t take = std::min<size_t>(width, word.size() - i);
+            lines.push_back(word.substr(i, take));
+            i += take;
+          }
+        }
+      }
+    }
+    word.clear();
+  };
+
+  for (char c : text) {
+    if (c == '\n') {
+      flushWord();
+      lines.push_back(line);
+      line.clear();
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      flushWord();
+    } else {
+      word.push_back(c);
+    }
+  }
+  flushWord();
+  if (!line.empty() || lines.empty()) lines.push_back(line);
+  return lines;
+}
+
+static std::vector<std::string> wrapTextChars(const std::string& text, int width) {
+  std::vector<std::string> lines;
+  if (width <= 0) return lines;
+  std::string line;
+  for (char c : text) {
+    if (c == '\n') {
+      lines.push_back(line);
+      line.clear();
+      continue;
+    }
+    line.push_back(c);
+    if ((int)line.size() >= width) {
+      lines.push_back(line);
+      line.clear();
+    }
+  }
+  if (!line.empty() || lines.empty()) lines.push_back(line);
+  return lines;
+}
+
+struct TuiMessage {
+  std::string role;
+  std::string content;
+};
+
+struct TuiRenderLine {
+  std::string text;
+  int colorPair{0};
+};
+
+class TuiApp {
+public:
+  TuiApp(std::string baseUrl,
+         std::string model,
+         std::string apiKey,
+         std::optional<std::string> systemPrompt)
+      : baseUrl_(std::move(baseUrl)),
+        model_(std::move(model)),
+        apiKey_(std::move(apiKey)),
+        systemPrompt_(std::move(systemPrompt)) {}
+
+  int run() {
+    setlocale(LC_ALL, "");
+    initscr();
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    curs_set(1);
+    if (has_colors()) {
+      start_color();
+      use_default_colors();
+      init_pair(kColorAssistant, COLOR_RED, -1);
+      init_pair(kColorUser, COLOR_GREEN, -1);
+      init_pair(kColorReasoning, COLOR_BLUE, -1);
+    }
+
+    bool running = true;
+    while (running) {
+      render();
+      int ch = getch();
+      if (ch == 3) { // Ctrl+C
+        running = false;
+        continue;
+      }
+      if (ch == KEY_PPAGE) {
+        scrollBy(-lastChatHeight_);
+        continue;
+      }
+      if (ch == KEY_NPAGE) {
+        scrollBy(lastChatHeight_);
+        continue;
+      }
+      if (ch == KEY_RESIZE) {
+        continue;
+      }
+      if (ch == '\n' || ch == KEY_ENTER) {
+        if (!input_.empty()) {
+          std::string prompt = input_;
+          input_.clear();
+          sendPrompt(prompt);
+        }
+        continue;
+      }
+      if (ch == KEY_BACKSPACE || ch == 127 || ch == 8) {
+        if (!input_.empty()) input_.pop_back();
+        continue;
+      }
+      if (std::isprint(ch)) {
+        input_.push_back(static_cast<char>(ch));
+      }
+    }
+
+    endwin();
+    return 0;
+  }
+
+  void appendReasoning(const std::string& chunk) {
+    reasoningText_ += chunk;
+    showReasoning_ = true;
+    render();
+  }
+
+  void clearReasoning() {
+    reasoningText_.clear();
+    showReasoning_ = false;
+  }
+
+  void appendAssistantDelta(const std::string& chunk) {
+    if (currentAssistantIndex_ < messages_.size()) {
+      messages_[currentAssistantIndex_].content += chunk;
+    }
+    stickToBottom_ = true;
+    render();
+  }
+
+private:
+  static constexpr int kColorAssistant = 1;
+  static constexpr int kColorUser = 2;
+  static constexpr int kColorReasoning = 3;
+  static constexpr const char* kHelpText =
+      "PgUp/PgDn scroll | Enter send | Ctrl+C quit | /clear clears";
+
+  std::string baseUrl_;
+  std::string model_;
+  std::string apiKey_;
+  std::optional<std::string> systemPrompt_;
+  std::vector<TuiMessage> messages_;
+  std::vector<std::pair<std::string, std::string>> history_;
+  std::string input_;
+  std::string reasoningText_;
+  bool showReasoning_{false};
+  bool responseStarted_{false};
+  size_t currentAssistantIndex_{0};
+  int scrollTop_{0};
+  int lastChatHeight_{1};
+  bool stickToBottom_{true};
+
+  void scrollBy(int delta) {
+    stickToBottom_ = false;
+    scrollTop_ += delta;
+    if (scrollTop_ < 0) scrollTop_ = 0;
+  }
+
+  std::vector<TuiRenderLine> buildChatLines(
+      int width,
+      const std::vector<std::string>& reasoningLines,
+      bool showReasoning
+  ) const {
+    std::vector<TuiRenderLine> lines;
+    int wrapWidth = std::max(1, width - 2);
+    for (const auto& msg : messages_) {
+      auto wrapped = wrapTextWords(msg.content, wrapWidth);
+      for (const auto& line : wrapped) {
+        TuiRenderLine out;
+        out.colorPair = (msg.role == "user") ? kColorUser : kColorAssistant;
+        if (msg.role == "user") {
+          int indent = std::max(0, width - (int)line.size());
+          out.text = std::string(indent, ' ') + line;
+        } else {
+          out.text = line;
+        }
+        lines.push_back(std::move(out));
+      }
+      lines.push_back({"", 0});
+    }
+    if (showReasoning) {
+      for (const auto& line : reasoningLines) {
+        lines.push_back({line, kColorReasoning});
+      }
+    }
+    if (!lines.empty() && lines.back().text.empty()) lines.pop_back();
+    return lines;
+  }
+
+  void render() {
+    int h = 0;
+    int w = 0;
+    getmaxyx(stdscr, h, w);
+    if (h <= 0 || w <= 0) return;
+
+    std::string inputDisplay = "> " + input_;
+    auto inputLines = wrapTextChars(inputDisplay, w);
+    int inputHeight = std::max(1, (int)inputLines.size());
+    if (inputHeight >= h) {
+      inputHeight = std::max(1, h - 1);
+    }
+    lastChatHeight_ = std::max(1, h - inputHeight);
+
+    erase();
+
+    std::vector<std::string> reasoningLines(3, "");
+    if (showReasoning_) {
+      int reasoningWidth = std::max(1, w / 2);
+      int contentWidth = std::max(1, reasoningWidth - 2);
+      auto rlines = wrapTextChars(reasoningText_, contentWidth);
+      size_t start = (rlines.size() > 2) ? (rlines.size() - 2) : 0;
+      size_t outIdx = 1 + (2 - (rlines.size() - start));
+      for (size_t i = start; i < rlines.size() && outIdx < 3; i++, outIdx++) {
+        reasoningLines[outIdx] = rlines[i];
+      }
+      std::string label = "thinking...";
+      if ((int)label.size() > contentWidth) label.resize(contentWidth);
+      std::string top = label;
+      if ((int)top.size() < contentWidth) top.append(contentWidth - top.size(), ' ');
+      reasoningLines[0] = top;
+      for (int i = 0; i < 3; i++) {
+        std::string line = reasoningLines[i];
+        if ((int)line.size() < contentWidth) line.append(contentWidth - line.size(), ' ');
+        reasoningLines[i] = "|" + line + "|";
+      }
+    }
+
+    auto chatLines = buildChatLines(w, reasoningLines, showReasoning_);
+    int chatStartRow = 0;
+    int chatHeight = lastChatHeight_;
+    if (lastChatHeight_ >= 2) {
+      chatStartRow = 1;
+      chatHeight = lastChatHeight_ - 1;
+      mvaddnstr(0, 0, kHelpText, w);
+    }
+
+    int maxTop = std::max(0, (int)chatLines.size() - chatHeight);
+    if (stickToBottom_) scrollTop_ = maxTop;
+    if (scrollTop_ > maxTop) scrollTop_ = maxTop;
+
+    for (int row = 0; row < chatHeight; row++) {
+      int idx = scrollTop_ + row;
+      if (idx >= (int)chatLines.size()) break;
+      const auto& line = chatLines[idx];
+      if (line.colorPair > 0 && has_colors()) attron(COLOR_PAIR(line.colorPair));
+      mvaddnstr(chatStartRow + row, 0, line.text.c_str(), w);
+      if (line.colorPair > 0 && has_colors()) attroff(COLOR_PAIR(line.colorPair));
+    }
+
+    int inputStart = lastChatHeight_;
+    if ((int)inputLines.size() > inputHeight) {
+      int skip = (int)inputLines.size() - inputHeight;
+      inputLines.erase(inputLines.begin(), inputLines.begin() + skip);
+    }
+    for (int i = 0; i < inputHeight && i < (int)inputLines.size(); i++) {
+      mvaddnstr(inputStart + i, 0, inputLines[i].c_str(), w);
+    }
+
+    int cursorRow = inputStart + std::max(0, (int)inputLines.size() - 1);
+    int cursorCol = inputLines.empty() ? 0 : (int)inputLines.back().size();
+    if (cursorRow >= h) cursorRow = h - 1;
+    if (cursorCol >= w) cursorCol = w - 1;
+    move(cursorRow, cursorCol);
+
+    refresh();
+  }
+
+  void sendPrompt(const std::string& prompt) {
+    if (prompt == "/clear") {
+      messages_.clear();
+      history_.clear();
+      reasoningText_.clear();
+      showReasoning_ = false;
+      scrollTop_ = 0;
+      stickToBottom_ = true;
+      render();
+      return;
+    }
+
+    messages_.push_back({"user", prompt});
+    history_.push_back({"user", prompt});
+    messages_.push_back({"assistant", ""});
+    currentAssistantIndex_ = messages_.size() - 1;
+    reasoningText_.clear();
+    showReasoning_ = false;
+    responseStarted_ = false;
+    stickToBottom_ = true;
+    render();
+
+    StreamState st;
+    st.useCallbacks = true;
+    st.onReasoning = [&](const std::string& chunk) { appendReasoning(chunk); };
+    st.onContentStart = [&]() {
+      responseStarted_ = true;
+      clearReasoning();
+      render();
+    };
+    st.onContent = [&](const std::string& chunk) { appendAssistantDelta(chunk); };
+
+    std::string url = baseUrl_ + "/chat/completions";
+    std::string body = buildChatRequestJson(
+        model_,
+        systemPrompt_,
+        history_,
+        prompt,
+        /*temperature=*/0.7,
+        /*stream=*/true
+    );
+
+    long httpCode = 0;
+    std::string err;
+    bool ok = httpPostJsonStream(url, body,
+                                 (apiKey_.empty() ? std::nullopt : std::optional<std::string>(apiKey_)),
+                                 httpCode, err, st);
+
+    if (!ok) {
+      messages_[currentAssistantIndex_].content = "[request failed: " + err + "]";
+      render();
+      return;
+    }
+
+    if (httpCode < 200 || httpCode >= 300) {
+      messages_[currentAssistantIndex_].content = "[http " + std::to_string(httpCode) + "]";
+      render();
+      return;
+    }
+
+    if (!st.assistantAll.empty()) {
+      history_.push_back({"assistant", st.assistantAll});
+    }
+  }
+};
+
 // ------------------------- main -------------------------
 
-#ifndef LM_TESTING
-int main(int argc, char** argv) {
+static int runCli(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: lm \"prompt\" [more words...]\n"
               << "          [--file path] [--cmd \"cmd\"] [--model model_id]\n"
-              << "          [--new] [--no-color] [--raw]\n\n"
+              << "          [--new] [--no-color] [--raw]\n"
+              << "          [--tui]\n\n"
               << "env:\n"
               << "  LM_BASE_URL        e.g. http://localhost:1234/v1\n"
               << "  LM_MODEL           optional model id\n"
@@ -806,6 +1209,7 @@ int main(int argc, char** argv) {
     std::string arg = argv[i];
 
     if (arg == "--new") { newConv = true; continue; }
+    if (arg == "--tui") { continue; }
 
     if (arg == "--file") {
       if (i + 1 >= argc) { std::cerr << "error: --file expects a path\n"; return 2; }
@@ -908,5 +1312,61 @@ int main(int argc, char** argv) {
   }
 
   return 0;
+}
+
+static int runTui(int argc, char** argv) {
+  std::string baseUrl = getEnv("LM_BASE_URL");
+  if (baseUrl.empty()) {
+    std::cerr << "error: LM_BASE_URL not set (e.g. export LM_BASE_URL=\"http://localhost:1234/v1\")\n";
+    return 2;
+  }
+  baseUrl = trimTrailingSlash(baseUrl);
+
+  std::string model = getEnv("LM_MODEL");
+  std::string apiKey = getEnv("LM_API_KEY");
+  std::string systemPromptEnv = getEnv("LM_SYSTEM_PROMPT");
+  std::optional<std::string> systemPrompt = systemPromptEnv.empty() ? std::nullopt
+                                                                    : std::optional<std::string>(systemPromptEnv);
+
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--tui") continue;
+    if (arg == "--model") {
+      if (i + 1 >= argc) { std::cerr << "error: --model expects a model id\n"; return 2; }
+      model = argv[++i];
+      continue;
+    }
+    if (arg == "--no-color" || arg == "--raw" || arg == "--file" || arg == "--cmd" || arg == "--new") {
+      std::cerr << "error: " << arg << " is not supported in --tui mode\n";
+      return 2;
+    }
+    if (arg.rfind("--", 0) == 0) {
+      std::cerr << "error: unknown option " << arg << "\n";
+      return 2;
+    }
+    std::cerr << "error: prompt text is not supported in --tui mode\n";
+    return 2;
+  }
+
+  if (model.empty()) model = "local-model";
+
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  TuiApp app(baseUrl, model, apiKey, systemPrompt);
+  int rc = app.run();
+  curl_global_cleanup();
+  return rc;
+}
+
+#ifndef LM_TESTING
+int main(int argc, char** argv) {
+  bool useTui = (argc == 1);
+  for (int i = 1; i < argc; i++) {
+    if (std::string(argv[i]) == "--tui") {
+      useTui = true;
+      break;
+    }
+  }
+  if (useTui) return runTui(argc, argv);
+  return runCli(argc, argv);
 }
 #endif
