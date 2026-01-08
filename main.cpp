@@ -189,6 +189,7 @@ struct ReasoningWindow {
   size_t height{3};
   bool render{false};
   bool printed{false};
+  bool allocated{false};
   std::deque<std::string> lines;
   std::string current;
 
@@ -211,6 +212,7 @@ struct ReasoningWindow {
   void reset() {
     lines.clear();
     current.clear();
+    printed = false;
   }
 
   std::vector<std::string> snapshotLines() const {
@@ -227,8 +229,10 @@ struct ReasoningWindow {
   }
 
   void draw() {
+    if (!render) return;
+    ensureAllocated();
     std::vector<std::string> view = snapshotLines();
-    if (printed) moveCursorUp(height);
+    if (printed) moveCursorUp(height - 1);
     for (size_t i = 0; i < height; i++) {
       clearLine();
       std::string line = view[i];
@@ -243,7 +247,7 @@ struct ReasoningWindow {
 
   void clearDisplay() {
     if (!render || !printed) return;
-    moveCursorUp(height);
+    moveCursorUp(height - 1);
     for (size_t i = 0; i < height; i++) {
       clearLine();
       if (i + 1 < height) moveDown();
@@ -258,6 +262,17 @@ private:
     lines.push_back(current);
     current.clear();
     while (lines.size() > height) lines.pop_front();
+  }
+
+  void ensureAllocated() {
+    if (allocated) return;
+    for (size_t i = 0; i < height; i++) {
+      std::cout << std::string(width, ' ');
+      if (i + 1 < height) std::cout << "\n";
+    }
+    std::cout.flush();
+    moveCursorUp(height - 1);
+    allocated = true;
   }
 
   void moveCursorUp(size_t n) const {
