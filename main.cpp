@@ -5,14 +5,17 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <curses.h>
 #include <deque>
 #include <filesystem>
 #include <functional>
 #include <fstream>
 #include <locale.h>
+#include <map>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -25,6 +28,7 @@
   #define popen _popen
   #define pclose _pclose
 #else
+  #include <sys/wait.h>
   #include <unistd.h>
 #endif
 
@@ -39,6 +43,48 @@ static std::string trimTrailingSlash(std::string s) {
   while (!s.empty() && s.back() == '/') s.pop_back();
   return s;
 }
+
+static std::string trimCopy(const std::string& s) {
+  size_t start = 0;
+  while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) start++;
+  size_t end = s.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) end--;
+  return s.substr(start, end - start);
+}
+
+static std::string expandUserPath(const std::string& path) {
+  if (path.empty() || path[0] != '~') return path;
+  std::string home = getEnv("HOME");
+  if (home.empty()) return path;
+  if (path == "~") return home;
+  if (path.size() >= 2 && path[1] == '/') return home + path.substr(1);
+  return path;
+}
+
+struct ToolSpecInput {
+  std::string name;
+  std::string description;
+};
+
+struct ToolSpec {
+  std::string name;
+  std::string command;
+  std::string description;
+  std::vector<ToolSpecInput> inputs;
+};
+
+struct ToolCall {
+  std::string id;
+  std::string name;
+  std::string argumentsJson;
+};
+
+struct ChatMessage {
+  std::string role;
+  std::string content;
+  std::vector<ToolCall> toolCalls;
+  std::string toolCallId;
+};
 
 static std::string readFileAll(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
@@ -66,6 +112,294 @@ static std::string runCommandCapture(const std::string& cmd) {
   }
   pclose(pipe);
   return out;
+}
+
+static bool isValidToolName(const std::string& name) {
+  if (name.empty() || name.size() > 64) return false;
+  for (char c : name) {
+    if (std::isalnum(static_cast<unsigned char>(c))) continue;
+    if (c == '_' || c == '-') continue;
+    return false;
+  }
+  return true;
+}
+
+static std::optional<std::string> parseTomlBasicString(const std::string& raw) {
+  std::string s = trimCopy(raw);
+  if (s.size() < 2 || s.front() != '"' || s.back() != '"') return std::nullopt;
+  std::string out;
+  bool escaping = false;
+  for (size_t i = 1; i + 1 < s.size(); i++) {
+    char c = s[i];
+    if (!escaping && c == '\\') {
+      escaping = true;
+      continue;
+    }
+    if (!escaping) {
+      out.push_back(c);
+      continue;
+    }
+    escaping = false;
+    switch (c) {
+      case 'n': out.push_back('\n'); break;
+      case 'r': out.push_back('\r'); break;
+      case 't': out.push_back('\t'); break;
+      case '"': out.push_back('"'); break;
+      case '\\': out.push_back('\\'); break;
+      default: out.push_back(c); break;
+    }
+  }
+  if (escaping) return std::nullopt;
+  return out;
+}
+
+static std::string stripTomlComment(const std::string& line) {
+  bool inQuote = false;
+  bool escaping = false;
+  for (size_t i = 0; i < line.size(); i++) {
+    char c = line[i];
+    if (inQuote) {
+      if (escaping) {
+        escaping = false;
+      } else if (c == '\\') {
+        escaping = true;
+      } else if (c == '"') {
+        inQuote = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      inQuote = true;
+      continue;
+    }
+    if (c == '#') return line.substr(0, i);
+  }
+  return line;
+}
+
+static std::vector<ToolSpec> loadToolSpecsFromToml(const std::string& path, std::vector<std::string>& warningsOut) {
+  std::ifstream f(path);
+  if (!f) return {};
+
+  std::vector<ToolSpec> tools;
+  ToolSpec current;
+  bool inTool = false;
+  bool inInputs = false;
+  std::set<std::string> seenNames;
+  std::string line;
+  int lineNo = 0;
+
+  auto flushTool = [&]() {
+    if (!inTool) return;
+    if (current.name.empty() || current.command.empty() || current.description.empty()) {
+      warningsOut.push_back("skills.toml: skipped tool with missing name/command/description");
+    } else if (!isValidToolName(current.name)) {
+      warningsOut.push_back("skills.toml: skipped tool '" + current.name + "' (name must match [A-Za-z0-9_-]{1,64})");
+    } else if (seenNames.count(current.name)) {
+      warningsOut.push_back("skills.toml: skipped duplicate tool name '" + current.name + "'");
+    } else {
+      seenNames.insert(current.name);
+      tools.push_back(current);
+    }
+    current = ToolSpec{};
+    inTool = false;
+    inInputs = false;
+  };
+
+  while (std::getline(f, line)) {
+    lineNo++;
+    std::string cleaned = trimCopy(stripTomlComment(line));
+    if (cleaned.empty()) continue;
+
+    if (cleaned == "[[tools]]" || cleaned == "[[tool]]") {
+      flushTool();
+      inTool = true;
+      inInputs = false;
+      continue;
+    }
+    if (cleaned == "[tools.inputs]" || cleaned == "[tool.inputs]") {
+      if (!inTool) {
+        warningsOut.push_back("skills.toml:" + std::to_string(lineNo) + ": inputs section without active tool");
+      } else {
+        inInputs = true;
+      }
+      continue;
+    }
+    if (!inTool) {
+      warningsOut.push_back("skills.toml:" + std::to_string(lineNo) + ": ignored line outside [[tools]]");
+      continue;
+    }
+
+    size_t eq = cleaned.find('=');
+    if (eq == std::string::npos) {
+      warningsOut.push_back("skills.toml:" + std::to_string(lineNo) + ": expected key = \"value\"");
+      continue;
+    }
+    std::string key = trimCopy(cleaned.substr(0, eq));
+    std::string rawVal = trimCopy(cleaned.substr(eq + 1));
+    auto parsedVal = parseTomlBasicString(rawVal);
+    if (!parsedVal) {
+      warningsOut.push_back("skills.toml:" + std::to_string(lineNo) + ": only basic quoted string values are supported");
+      continue;
+    }
+
+    if (inInputs) {
+      bool replaced = false;
+      for (auto& input : current.inputs) {
+        if (input.name == key) {
+          input.description = *parsedVal;
+          replaced = true;
+          break;
+        }
+      }
+      if (!replaced) current.inputs.push_back({key, *parsedVal});
+      continue;
+    }
+
+    if (key == "name") current.name = *parsedVal;
+    else if (key == "command") current.command = *parsedVal;
+    else if (key == "description") current.description = *parsedVal;
+    else warningsOut.push_back("skills.toml:" + std::to_string(lineNo) + ": ignored key '" + key + "'");
+  }
+
+  flushTool();
+  return tools;
+}
+
+static std::vector<std::string> extractTemplateVariables(const std::string& commandTemplate) {
+  std::vector<std::string> vars;
+  std::set<std::string> seen;
+  for (size_t i = 0; i < commandTemplate.size(); i++) {
+    if (commandTemplate[i] != '$') continue;
+    if (i + 1 >= commandTemplate.size()) continue;
+    char first = commandTemplate[i + 1];
+    if (!(std::isalpha(static_cast<unsigned char>(first)) || first == '_')) continue;
+    size_t j = i + 2;
+    while (j < commandTemplate.size()) {
+      char c = commandTemplate[j];
+      if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') j++;
+      else break;
+    }
+    std::string var = commandTemplate.substr(i + 1, j - (i + 1));
+    if (!seen.count(var)) {
+      seen.insert(var);
+      vars.push_back(var);
+    }
+    i = j - 1;
+  }
+  return vars;
+}
+
+static std::string shellQuoteSingle(const std::string& s) {
+  std::string out = "'";
+  for (char c : s) {
+    if (c == '\'') out += "'\"'\"'";
+    else out.push_back(c);
+  }
+  out += "'";
+  return out;
+}
+
+static std::string renderToolCommand(
+    const std::string& commandTemplate,
+    const std::map<std::string, std::string>& args
+) {
+  std::string out;
+  for (size_t i = 0; i < commandTemplate.size(); i++) {
+    char c = commandTemplate[i];
+    if (c != '$' || i + 1 >= commandTemplate.size()) {
+      out.push_back(c);
+      continue;
+    }
+    char first = commandTemplate[i + 1];
+    if (!(std::isalpha(static_cast<unsigned char>(first)) || first == '_')) {
+      out.push_back(c);
+      continue;
+    }
+    size_t j = i + 2;
+    while (j < commandTemplate.size()) {
+      char cc = commandTemplate[j];
+      if (std::isalnum(static_cast<unsigned char>(cc)) || cc == '_') j++;
+      else break;
+    }
+    std::string var = commandTemplate.substr(i + 1, j - (i + 1));
+    auto it = args.find(var);
+    if (it != args.end()) out += shellQuoteSingle(it->second);
+    else out += "$" + var;
+    i = j - 1;
+  }
+  return out;
+}
+
+struct CommandRunResult {
+  int exitCode{0};
+  std::string stdoutText;
+  std::string stderrText;
+  bool launchFailed{false};
+  std::string launchError;
+};
+
+static CommandRunResult runCommandCaptureSplit(const std::string& cmd) {
+  CommandRunResult result;
+  std::filesystem::path tmpDir;
+  const auto now = static_cast<unsigned long long>(std::time(nullptr));
+  for (int attempt = 0; attempt < 32; attempt++) {
+    tmpDir = std::filesystem::temp_directory_path() /
+             ("lm_tool_" + std::to_string(now) + "_" + std::to_string(attempt));
+    if (!std::filesystem::exists(tmpDir)) {
+      std::error_code ec;
+      if (std::filesystem::create_directory(tmpDir, ec)) break;
+    }
+    if (attempt == 31) {
+      result.launchFailed = true;
+      result.launchError = "failed to create temp directory for command output";
+      return result;
+    }
+  }
+
+  std::filesystem::path outPath = tmpDir / "stdout.txt";
+  std::filesystem::path errPath = tmpDir / "stderr.txt";
+  std::string wrapped = "sh -lc " + shellQuoteSingle(cmd) +
+                        " > " + shellQuoteSingle(outPath.string()) +
+                        " 2> " + shellQuoteSingle(errPath.string());
+
+  int rc = std::system(wrapped.c_str());
+  if (rc == -1) {
+    result.launchFailed = true;
+    result.launchError = "failed to start shell command";
+  }
+
+  if (!result.launchFailed) {
+#if defined(_WIN32)
+    result.exitCode = rc;
+#else
+    if (WIFEXITED(rc)) result.exitCode = WEXITSTATUS(rc);
+    else if (WIFSIGNALED(rc)) result.exitCode = 128 + WTERMSIG(rc);
+    else result.exitCode = rc;
+#endif
+  }
+
+  auto readIfExists = [](const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return std::string();
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+  };
+  result.stdoutText = readIfExists(outPath);
+  result.stderrText = readIfExists(errPath);
+
+  std::error_code ec;
+  std::filesystem::remove_all(tmpDir, ec);
+  return result;
+}
+
+static std::string truncateForDisplay(const std::string& text, size_t maxChars) {
+  if (text.size() <= maxChars) return text;
+  std::ostringstream oss;
+  oss << text.substr(0, maxChars)
+      << "\n...[truncated " << (text.size() - maxChars) << " chars]";
+  return oss.str();
 }
 
 // ------------------------- JSON (minimal) -------------------------
@@ -137,42 +471,291 @@ static std::optional<std::string> parseJsonStringAt(const std::string& s, size_t
   return std::nullopt;
 }
 
+struct JsonValue {
+  enum class Type { Null, Bool, Number, String, Object, Array };
+  Type type{Type::Null};
+  bool boolValue{false};
+  std::string stringValue;
+  std::vector<std::pair<std::string, JsonValue>> objectValue;
+  std::vector<JsonValue> arrayValue;
+};
+
+static void skipJsonWs(const std::string& s, size_t& i) {
+  while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) i++;
+}
+
+static bool parseJsonValue(const std::string& s, size_t& i, JsonValue& out);
+
+static bool parseJsonObject(const std::string& s, size_t& i, JsonValue& out) {
+  if (i >= s.size() || s[i] != '{') return false;
+  i++;
+  out = JsonValue{};
+  out.type = JsonValue::Type::Object;
+  skipJsonWs(s, i);
+  if (i < s.size() && s[i] == '}') {
+    i++;
+    return true;
+  }
+  while (i < s.size()) {
+    skipJsonWs(s, i);
+    auto key = parseJsonStringAt(s, i);
+    if (!key) return false;
+    skipJsonWs(s, i);
+    if (i >= s.size() || s[i] != ':') return false;
+    i++;
+    skipJsonWs(s, i);
+    JsonValue val;
+    if (!parseJsonValue(s, i, val)) return false;
+    out.objectValue.push_back({*key, std::move(val)});
+    skipJsonWs(s, i);
+    if (i >= s.size()) return false;
+    if (s[i] == '}') {
+      i++;
+      return true;
+    }
+    if (s[i] != ',') return false;
+    i++;
+  }
+  return false;
+}
+
+static bool parseJsonArray(const std::string& s, size_t& i, JsonValue& out) {
+  if (i >= s.size() || s[i] != '[') return false;
+  i++;
+  out = JsonValue{};
+  out.type = JsonValue::Type::Array;
+  skipJsonWs(s, i);
+  if (i < s.size() && s[i] == ']') {
+    i++;
+    return true;
+  }
+  while (i < s.size()) {
+    skipJsonWs(s, i);
+    JsonValue val;
+    if (!parseJsonValue(s, i, val)) return false;
+    out.arrayValue.push_back(std::move(val));
+    skipJsonWs(s, i);
+    if (i >= s.size()) return false;
+    if (s[i] == ']') {
+      i++;
+      return true;
+    }
+    if (s[i] != ',') return false;
+    i++;
+  }
+  return false;
+}
+
+static bool parseJsonNumber(const std::string& s, size_t& i, JsonValue& out) {
+  size_t start = i;
+  if (i < s.size() && s[i] == '-') i++;
+  if (i >= s.size()) return false;
+  if (s[i] == '0') {
+    i++;
+  } else if (std::isdigit(static_cast<unsigned char>(s[i]))) {
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) i++;
+  } else {
+    return false;
+  }
+
+  if (i < s.size() && s[i] == '.') {
+    i++;
+    if (i >= s.size() || !std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) i++;
+  }
+
+  if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+    i++;
+    if (i < s.size() && (s[i] == '+' || s[i] == '-')) i++;
+    if (i >= s.size() || !std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+    while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) i++;
+  }
+
+  out = JsonValue{};
+  out.type = JsonValue::Type::Number;
+  out.stringValue = s.substr(start, i - start);
+  return true;
+}
+
+static bool parseJsonValue(const std::string& s, size_t& i, JsonValue& out) {
+  skipJsonWs(s, i);
+  if (i >= s.size()) return false;
+  if (s[i] == '"') {
+    auto v = parseJsonStringAt(s, i);
+    if (!v) return false;
+    out = JsonValue{};
+    out.type = JsonValue::Type::String;
+    out.stringValue = *v;
+    return true;
+  }
+  if (s[i] == '{') return parseJsonObject(s, i, out);
+  if (s[i] == '[') return parseJsonArray(s, i, out);
+  if (s.compare(i, 4, "true") == 0) {
+    i += 4;
+    out = JsonValue{};
+    out.type = JsonValue::Type::Bool;
+    out.boolValue = true;
+    return true;
+  }
+  if (s.compare(i, 5, "false") == 0) {
+    i += 5;
+    out = JsonValue{};
+    out.type = JsonValue::Type::Bool;
+    out.boolValue = false;
+    return true;
+  }
+  if (s.compare(i, 4, "null") == 0) {
+    i += 4;
+    out = JsonValue{};
+    out.type = JsonValue::Type::Null;
+    return true;
+  }
+  return parseJsonNumber(s, i, out);
+}
+
+static bool parseJsonDocument(const std::string& s, JsonValue& out) {
+  size_t i = 0;
+  if (!parseJsonValue(s, i, out)) return false;
+  skipJsonWs(s, i);
+  return i == s.size();
+}
+
+static const JsonValue* jsonObjectGet(const JsonValue* object, const std::string& key) {
+  if (!object || object->type != JsonValue::Type::Object) return nullptr;
+  for (const auto& [k, v] : object->objectValue) {
+    if (k == key) return &v;
+  }
+  return nullptr;
+}
+
+static const JsonValue* jsonArrayGet(const JsonValue* array, size_t idx) {
+  if (!array || array->type != JsonValue::Type::Array) return nullptr;
+  if (idx >= array->arrayValue.size()) return nullptr;
+  return &array->arrayValue[idx];
+}
+
+static std::optional<std::string> jsonString(const JsonValue* v) {
+  if (!v || v->type != JsonValue::Type::String) return std::nullopt;
+  return v->stringValue;
+}
+
+static std::optional<int> jsonInt(const JsonValue* v) {
+  if (!v || v->type != JsonValue::Type::Number) return std::nullopt;
+  char* end = nullptr;
+  long num = std::strtol(v->stringValue.c_str(), &end, 10);
+  if (!end || *end != '\0') return std::nullopt;
+  return static_cast<int>(num);
+}
+
+static std::string jsonSerializeCompact(const JsonValue& v) {
+  switch (v.type) {
+    case JsonValue::Type::Null:
+      return "null";
+    case JsonValue::Type::Bool:
+      return v.boolValue ? "true" : "false";
+    case JsonValue::Type::Number:
+      return v.stringValue;
+    case JsonValue::Type::String:
+      return "\"" + jsonEscape(v.stringValue) + "\"";
+    case JsonValue::Type::Array: {
+      std::ostringstream oss;
+      oss << "[";
+      for (size_t i = 0; i < v.arrayValue.size(); i++) {
+        if (i > 0) oss << ",";
+        oss << jsonSerializeCompact(v.arrayValue[i]);
+      }
+      oss << "]";
+      return oss.str();
+    }
+    case JsonValue::Type::Object: {
+      std::ostringstream oss;
+      oss << "{";
+      bool first = true;
+      for (const auto& [k, child] : v.objectValue) {
+        if (!first) oss << ",";
+        first = false;
+        oss << "\"" << jsonEscape(k) << "\":" << jsonSerializeCompact(child);
+      }
+      oss << "}";
+      return oss.str();
+    }
+  }
+  return "null";
+}
+
+static const JsonValue* extractStreamChoiceDelta(const std::string& json, JsonValue& rootOut) {
+  if (!parseJsonDocument(json, rootOut)) return nullptr;
+  const JsonValue* choices = jsonObjectGet(&rootOut, "choices");
+  const JsonValue* first = jsonArrayGet(choices, 0);
+  return jsonObjectGet(first, "delta");
+}
+
 static std::optional<std::string> extractStreamDeltaContent(const std::string& json) {
-  // Typical chunk:
-  // {"choices":[{"delta":{"content":"hi"},"index":0,"finish_reason":null}]}
-  size_t d = json.find("\"delta\"");
-  if (d == std::string::npos) return std::nullopt;
-
-  size_t c = json.find("\"content\"", d);
-  if (c == std::string::npos) return std::nullopt;
-
-  size_t colon = json.find(':', c);
-  if (colon == std::string::npos) return std::nullopt;
-
-  size_t i = colon + 1;
-  while (i < json.size() && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) i++;
-
-  if (i >= json.size() || json[i] != '"') return std::nullopt;
-  return parseJsonStringAt(json, i);
+  JsonValue root;
+  const JsonValue* delta = extractStreamChoiceDelta(json, root);
+  return jsonString(jsonObjectGet(delta, "content"));
 }
 
 static std::optional<std::string> extractStreamDeltaReasoning(const std::string& json) {
-  // Typical chunk:
-  // {"choices":[{"delta":{"reasoning":"thinking..."},"index":0,"finish_reason":null}]}
-  size_t d = json.find("\"delta\"");
-  if (d == std::string::npos) return std::nullopt;
+  JsonValue root;
+  const JsonValue* delta = extractStreamChoiceDelta(json, root);
+  return jsonString(jsonObjectGet(delta, "reasoning"));
+}
 
-  size_t r = json.find("\"reasoning\"", d);
-  if (r == std::string::npos) return std::nullopt;
+struct ToolCallDelta {
+  int index{0};
+  std::optional<std::string> id;
+  std::optional<std::string> name;
+  std::optional<std::string> argumentsChunk;
+};
 
-  size_t colon = json.find(':', r);
-  if (colon == std::string::npos) return std::nullopt;
+static std::vector<ToolCallDelta> extractStreamDeltaToolCalls(const std::string& json) {
+  JsonValue root;
+  const JsonValue* delta = extractStreamChoiceDelta(json, root);
+  const JsonValue* toolCalls = jsonObjectGet(delta, "tool_calls");
+  if (!toolCalls || toolCalls->type != JsonValue::Type::Array) return {};
 
-  size_t i = colon + 1;
-  while (i < json.size() && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) i++;
+  std::vector<ToolCallDelta> out;
+  for (const auto& item : toolCalls->arrayValue) {
+    if (item.type != JsonValue::Type::Object) continue;
+    auto idx = jsonInt(jsonObjectGet(&item, "index"));
+    if (!idx) continue;
+    ToolCallDelta d;
+    d.index = *idx;
+    d.id = jsonString(jsonObjectGet(&item, "id"));
+    const JsonValue* fn = jsonObjectGet(&item, "function");
+    d.name = jsonString(jsonObjectGet(fn, "name"));
+    d.argumentsChunk = jsonString(jsonObjectGet(fn, "arguments"));
+    out.push_back(std::move(d));
+  }
+  return out;
+}
 
-  if (i >= json.size() || json[i] != '"') return std::nullopt;
-  return parseJsonStringAt(json, i);
+static std::optional<std::string> extractStreamFinishReason(const std::string& json) {
+  JsonValue root;
+  if (!parseJsonDocument(json, root)) return std::nullopt;
+  const JsonValue* choices = jsonObjectGet(&root, "choices");
+  const JsonValue* first = jsonArrayGet(choices, 0);
+  return jsonString(jsonObjectGet(first, "finish_reason"));
+}
+
+static std::optional<std::map<std::string, std::string>> parseToolArgumentsObject(const std::string& argumentsJson) {
+  JsonValue root;
+  if (!parseJsonDocument(argumentsJson, root)) return std::nullopt;
+  if (root.type != JsonValue::Type::Object) return std::nullopt;
+  std::map<std::string, std::string> args;
+  for (const auto& [k, v] : root.objectValue) {
+    if (v.type == JsonValue::Type::String || v.type == JsonValue::Type::Number) {
+      args[k] = v.stringValue;
+    } else if (v.type == JsonValue::Type::Bool) {
+      args[k] = v.boolValue ? "true" : "false";
+    } else if (v.type == JsonValue::Type::Null) {
+      args[k] = "";
+    } else {
+      args[k] = jsonSerializeCompact(v);
+    }
+  }
+  return args;
 }
 
 // ------------------------- ANSI + streaming markdown-ish printer -------------------------
@@ -613,50 +1196,155 @@ static bool appendTurn(const std::string& path, const std::string& userMsg, cons
 
 static std::string buildChatRequestJson(
     const std::string& model,
-    const std::optional<std::string>& systemPrompt,
-    const std::vector<std::pair<std::string, std::string>>& history,
-    const std::string& userPrompt,
+    const std::vector<ChatMessage>& messages,
     double temperature,
-    bool stream
+    bool stream,
+    const std::vector<ToolSpec>* tools
 ) {
+  auto findInputDesc = [](const ToolSpec& tool, const std::string& inputName) -> std::optional<std::string> {
+    for (const auto& input : tool.inputs) {
+      if (input.name == inputName) return input.description;
+    }
+    return std::nullopt;
+  };
+
   std::ostringstream oss;
   oss << "{";
   oss << "\"model\":\"" << jsonEscape(model) << "\",";
   oss << "\"messages\":[";
-  bool first = true;
+  bool firstMsg = true;
 
-  auto addMsg = [&](const std::string& role, const std::string& content) {
-    if (!first) oss << ",";
-    first = false;
-    oss << "{"
-        << "\"role\":\"" << jsonEscape(role) << "\","
-        << "\"content\":\"" << jsonEscape(content) << "\""
-        << "}";
+  auto addMessage = [&](const ChatMessage& msg) {
+    if (!firstMsg) oss << ",";
+    firstMsg = false;
+    oss << "{";
+    oss << "\"role\":\"" << jsonEscape(msg.role) << "\"";
+    if (msg.role == "assistant" && !msg.toolCalls.empty()) {
+      oss << ",\"content\":\"" << jsonEscape(msg.content) << "\"";
+      oss << ",\"tool_calls\":[";
+      bool firstCall = true;
+      for (const auto& call : msg.toolCalls) {
+        if (!firstCall) oss << ",";
+        firstCall = false;
+        oss << "{";
+        oss << "\"id\":\"" << jsonEscape(call.id) << "\",";
+        oss << "\"type\":\"function\",";
+        oss << "\"function\":{";
+        oss << "\"name\":\"" << jsonEscape(call.name) << "\",";
+        oss << "\"arguments\":\"" << jsonEscape(call.argumentsJson) << "\"";
+        oss << "}";
+        oss << "}";
+      }
+      oss << "]";
+    } else if (msg.role == "tool") {
+      oss << ",\"tool_call_id\":\"" << jsonEscape(msg.toolCallId) << "\"";
+      oss << ",\"content\":\"" << jsonEscape(msg.content) << "\"";
+    } else {
+      oss << ",\"content\":\"" << jsonEscape(msg.content) << "\"";
+    }
+    oss << "}";
   };
 
-  if (systemPrompt && !systemPrompt->empty()) {
-    addMsg("system", *systemPrompt);
-  }
-
-  for (const auto& [role, content] : history) {
-    if (role == "user" || role == "assistant") addMsg(role, content);
-  }
-
-  addMsg("user", userPrompt);
+  for (const auto& msg : messages) addMessage(msg);
 
   oss << "],";
   oss << "\"temperature\":" << temperature << ",";
   oss << "\"stream\":" << (stream ? "true" : "false");
+
+  if (tools && !tools->empty()) {
+    oss << ",\"tools\":[";
+    bool firstTool = true;
+    for (const auto& tool : *tools) {
+      if (!firstTool) oss << ",";
+      firstTool = false;
+      std::vector<std::string> vars = extractTemplateVariables(tool.command);
+      std::set<std::string> seen(vars.begin(), vars.end());
+      for (const auto& input : tool.inputs) {
+        if (seen.count(input.name)) continue;
+        vars.push_back(input.name);
+        seen.insert(input.name);
+      }
+
+      oss << "{";
+      oss << "\"type\":\"function\",";
+      oss << "\"function\":{";
+      oss << "\"name\":\"" << jsonEscape(tool.name) << "\",";
+      oss << "\"description\":\"" << jsonEscape(tool.description) << "\",";
+      oss << "\"parameters\":{";
+      oss << "\"type\":\"object\",";
+      oss << "\"properties\":{";
+      bool firstProp = true;
+      for (const auto& var : vars) {
+        if (!firstProp) oss << ",";
+        firstProp = false;
+        oss << "\"" << jsonEscape(var) << "\":{";
+        oss << "\"type\":\"string\"";
+        auto desc = findInputDesc(tool, var);
+        if (desc && !desc->empty()) {
+          oss << ",\"description\":\"" << jsonEscape(*desc) << "\"";
+        }
+        oss << "}";
+      }
+      oss << "},";
+      oss << "\"required\":[";
+      bool firstRequired = true;
+      std::vector<std::string> required = extractTemplateVariables(tool.command);
+      for (const auto& var : required) {
+        if (!firstRequired) oss << ",";
+        firstRequired = false;
+        oss << "\"" << jsonEscape(var) << "\"";
+      }
+      oss << "],";
+      oss << "\"additionalProperties\":false";
+      oss << "}";
+      oss << "}";
+      oss << "}";
+    }
+    oss << "]";
+    oss << ",\"tool_choice\":\"auto\"";
+  }
+
   oss << "}";
   return oss.str();
+}
+
+static std::string buildChatRequestJson(
+    const std::string& model,
+    const std::optional<std::string>& systemPrompt,
+    const std::vector<std::pair<std::string, std::string>>& history,
+    const std::string& userPrompt,
+    double temperature,
+    bool stream,
+    const std::vector<ToolSpec>* tools = nullptr
+) {
+  std::vector<ChatMessage> messages;
+  if (systemPrompt && !systemPrompt->empty()) {
+    messages.push_back({"system", *systemPrompt, {}, ""});
+  }
+  for (const auto& [role, content] : history) {
+    if (role == "user" || role == "assistant") {
+      messages.push_back({role, content, {}, ""});
+    }
+  }
+  messages.push_back({"user", userPrompt, {}, ""});
+  return buildChatRequestJson(model, messages, temperature, stream, tools);
 }
 
 // ------------------------- curl streaming (SSE) -------------------------
 
 struct StreamState {
+  struct ToolCallAccum {
+    bool used{false};
+    std::string id;
+    std::string name;
+    std::string arguments;
+  };
+
   std::string sseBuf;
   std::string rawAll;          // keep for debugging / non-2xx
   std::string assistantAll;    // accumulated assistant content
+  std::string finishReason;
+  std::vector<ToolCallAccum> toolCallAccums;
   bool sawDone{false};
   bool responseStarted{false};
   StreamingMarkdownPrinter printer;
@@ -666,6 +1354,19 @@ struct StreamState {
   std::function<void()> onContentStart;
   std::function<void(const std::string&)> onContent;
 };
+
+static std::vector<ToolCall> collectToolCallsFromStream(const StreamState& st) {
+  std::vector<ToolCall> out;
+  for (const auto& accum : st.toolCallAccums) {
+    if (!accum.used || accum.name.empty()) continue;
+    ToolCall call;
+    call.id = accum.id.empty() ? ("call_" + accum.name) : accum.id;
+    call.name = accum.name;
+    call.argumentsJson = accum.arguments.empty() ? "{}" : accum.arguments;
+    out.push_back(std::move(call));
+  }
+  return out;
+}
 
 static size_t sseWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
   auto* st = reinterpret_cast<StreamState*>(userdata);
@@ -696,6 +1397,22 @@ static size_t sseWriteCb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     if (payload == "[DONE]") {
       st->sawDone = true;
       continue;
+    }
+
+    auto finishReason = extractStreamFinishReason(payload);
+    if (finishReason) st->finishReason = *finishReason;
+
+    auto toolCallDeltas = extractStreamDeltaToolCalls(payload);
+    for (const auto& tc : toolCallDeltas) {
+      if (tc.index < 0) continue;
+      if (st->toolCallAccums.size() <= static_cast<size_t>(tc.index)) {
+        st->toolCallAccums.resize(static_cast<size_t>(tc.index) + 1);
+      }
+      auto& accum = st->toolCallAccums[static_cast<size_t>(tc.index)];
+      accum.used = true;
+      if (tc.id && !tc.id->empty()) accum.id = *tc.id;
+      if (tc.name && !tc.name->empty()) accum.name = *tc.name;
+      if (tc.argumentsChunk) accum.arguments += *tc.argumentsChunk;
     }
 
     auto delta = extractStreamDeltaContent(payload);
@@ -784,6 +1501,145 @@ static bool httpPostJsonStream(
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   return true;
+}
+
+struct ToolRunRecord {
+  std::string toolName;
+  std::string toolCallId;
+  std::string inputJson;
+  std::string renderedCommand;
+  CommandRunResult commandResult;
+  bool toolFound{true};
+  std::string errorText;
+};
+
+static const ToolSpec* findToolByName(const std::vector<ToolSpec>& tools, const std::string& name) {
+  for (const auto& tool : tools) {
+    if (tool.name == name) return &tool;
+  }
+  return nullptr;
+}
+
+static std::string buildToolResultContent(const ToolRunRecord& run) {
+  std::ostringstream oss;
+  if (!run.toolFound) {
+    oss << "{"
+        << "\"error\":\"" << jsonEscape(run.errorText) << "\""
+        << "}";
+    return oss.str();
+  }
+  if (run.commandResult.launchFailed) {
+    oss << "{"
+        << "\"error\":\"" << jsonEscape(run.commandResult.launchError) << "\","
+        << "\"command\":\"" << jsonEscape(run.renderedCommand) << "\""
+        << "}";
+    return oss.str();
+  }
+  oss << "{";
+  oss << "\"command\":\"" << jsonEscape(run.renderedCommand) << "\",";
+  oss << "\"exit_code\":" << run.commandResult.exitCode << ",";
+  oss << "\"stdout\":\"" << jsonEscape(run.commandResult.stdoutText) << "\",";
+  oss << "\"stderr\":\"" << jsonEscape(run.commandResult.stderrText) << "\"";
+  oss << "}";
+  return oss.str();
+}
+
+static std::string buildToolInteractionDisplay(const ToolRunRecord& run, size_t sectionLimit = 600) {
+  std::ostringstream oss;
+  oss << "tool: " << run.toolName << "\n";
+  oss << "input:\n" << truncateForDisplay(run.inputJson, sectionLimit) << "\n";
+  if (!run.toolFound) {
+    oss << "error:\n" << run.errorText << "\n";
+    return oss.str();
+  }
+  oss << "command:\n" << truncateForDisplay(run.renderedCommand, sectionLimit) << "\n";
+  if (run.commandResult.launchFailed) {
+    oss << "error:\n" << run.commandResult.launchError << "\n";
+    return oss.str();
+  }
+  oss << "exit_code: " << run.commandResult.exitCode << "\n";
+  oss << "stdout:\n" << truncateForDisplay(run.commandResult.stdoutText, sectionLimit) << "\n";
+  oss << "stderr:\n" << truncateForDisplay(run.commandResult.stderrText, sectionLimit) << "\n";
+  return oss.str();
+}
+
+static ToolRunRecord executeToolCall(
+    const ToolCall& call,
+    const std::vector<ToolSpec>& toolSpecs
+) {
+  ToolRunRecord run;
+  run.toolName = call.name;
+  run.toolCallId = call.id;
+  run.inputJson = call.argumentsJson;
+
+  const ToolSpec* spec = findToolByName(toolSpecs, call.name);
+  if (!spec) {
+    run.toolFound = false;
+    run.errorText = "unknown tool '" + call.name + "'";
+    return run;
+  }
+
+  auto args = parseToolArgumentsObject(call.argumentsJson);
+  if (!args) {
+    run.toolFound = false;
+    run.errorText = "invalid tool arguments JSON";
+    return run;
+  }
+
+  run.renderedCommand = renderToolCommand(spec->command, *args);
+  run.commandResult = runCommandCaptureSplit(run.renderedCommand);
+  return run;
+}
+
+static std::vector<std::string> wrapTextChars(const std::string& text, int width);
+
+static std::vector<std::string> splitLines(const std::string& text) {
+  std::vector<std::string> lines;
+  std::string cur;
+  for (char c : text) {
+    if (c == '\n') {
+      lines.push_back(cur);
+      cur.clear();
+      continue;
+    }
+    if (c != '\r') cur.push_back(c);
+  }
+  lines.push_back(cur);
+  return lines;
+}
+
+static std::vector<std::string> buildBorderedLines(const std::string& text, int width) {
+  int innerWidth = std::max(1, width - 2);
+  std::vector<std::string> out;
+  out.push_back("+" + std::string(innerWidth, '-') + "+");
+  auto rawLines = splitLines(text);
+  for (const auto& raw : rawLines) {
+    auto wrapped = wrapTextChars(raw, innerWidth);
+    for (const auto& line : wrapped) {
+      std::string l = line;
+      if ((int)l.size() < innerWidth) l.append(innerWidth - (int)l.size(), ' ');
+      out.push_back("|" + l + "|");
+    }
+  }
+  out.push_back("+" + std::string(innerWidth, '-') + "+");
+  return out;
+}
+
+static int terminalWidthGuess() {
+  std::string cols = getEnv("COLUMNS");
+  if (!cols.empty()) {
+    int parsed = std::atoi(cols.c_str());
+    if (parsed > 10) return parsed;
+  }
+  return 100;
+}
+
+static void printBorderedBlockStdout(const std::string& text, int width) {
+  auto lines = buildBorderedLines(text, width);
+  for (const auto& line : lines) {
+    std::cout << line << "\n";
+  }
+  std::cout.flush();
 }
 
 // ------------------------- TUI helpers -------------------------
@@ -882,11 +1738,17 @@ public:
   TuiApp(std::string baseUrl,
          std::string model,
          std::string apiKey,
-         std::optional<std::string> systemPrompt)
+         std::optional<std::string> systemPrompt,
+         std::vector<ToolSpec> toolSpecs)
       : baseUrl_(std::move(baseUrl)),
         model_(std::move(model)),
         apiKey_(std::move(apiKey)),
-        systemPrompt_(std::move(systemPrompt)) {}
+        systemPrompt_(std::move(systemPrompt)),
+        toolSpecs_(std::move(toolSpecs)) {
+    if (systemPrompt_ && !systemPrompt_->empty()) {
+      historyMessages_.push_back({"system", *systemPrompt_, {}, ""});
+    }
+  }
 
   int run() {
     setlocale(LC_ALL, "");
@@ -901,6 +1763,7 @@ public:
       init_pair(kColorAssistant, COLOR_RED, -1);
       init_pair(kColorUser, COLOR_GREEN, -1);
       init_pair(kColorReasoning, COLOR_BLUE, -1);
+      init_pair(kColorTool, COLOR_CYAN, -1);
     }
 
     bool running = true;
@@ -966,6 +1829,7 @@ private:
   static constexpr int kColorAssistant = 1;
   static constexpr int kColorUser = 2;
   static constexpr int kColorReasoning = 3;
+  static constexpr int kColorTool = 4;
   static constexpr const char* kHelpText =
       "PgUp/PgDn scroll | Enter send | Ctrl+C quit | /clear clears";
 
@@ -973,8 +1837,9 @@ private:
   std::string model_;
   std::string apiKey_;
   std::optional<std::string> systemPrompt_;
+  std::vector<ToolSpec> toolSpecs_;
   std::vector<TuiMessage> messages_;
-  std::vector<std::pair<std::string, std::string>> history_;
+  std::vector<ChatMessage> historyMessages_;
   std::string input_;
   std::string reasoningText_;
   bool showReasoning_{false};
@@ -998,6 +1863,14 @@ private:
     std::vector<TuiRenderLine> lines;
     int wrapWidth = std::max(1, width - 2);
     for (const auto& msg : messages_) {
+      if (msg.role == "tool") {
+        auto boxed = buildBorderedLines(msg.content, width);
+        for (const auto& line : boxed) {
+          lines.push_back({line, kColorTool});
+        }
+        lines.push_back({"", 0});
+        continue;
+      }
       auto wrapped = wrapTextWords(msg.content, wrapWidth);
       for (const auto& line : wrapped) {
         TuiRenderLine out;
@@ -1102,7 +1975,10 @@ private:
   void sendPrompt(const std::string& prompt) {
     if (prompt == "/clear") {
       messages_.clear();
-      history_.clear();
+      historyMessages_.clear();
+      if (systemPrompt_ && !systemPrompt_->empty()) {
+        historyMessages_.push_back({"system", *systemPrompt_, {}, ""});
+      }
       reasoningText_.clear();
       showReasoning_ = false;
       scrollTop_ = 0;
@@ -1112,56 +1988,80 @@ private:
     }
 
     messages_.push_back({"user", prompt});
-    history_.push_back({"user", prompt});
-    messages_.push_back({"assistant", ""});
-    currentAssistantIndex_ = messages_.size() - 1;
-    reasoningText_.clear();
-    showReasoning_ = false;
-    responseStarted_ = false;
+    historyMessages_.push_back({"user", prompt, {}, ""});
     stickToBottom_ = true;
-    render();
-
-    StreamState st;
-    st.useCallbacks = true;
-    st.onReasoning = [&](const std::string& chunk) { appendReasoning(chunk); };
-    st.onContentStart = [&]() {
-      responseStarted_ = true;
-      clearReasoning();
-      render();
-    };
-    st.onContent = [&](const std::string& chunk) { appendAssistantDelta(chunk); };
 
     std::string url = baseUrl_ + "/chat/completions";
-    std::string body = buildChatRequestJson(
-        model_,
-        systemPrompt_,
-        history_,
-        prompt,
-        /*temperature=*/0.7,
-        /*stream=*/true
-    );
-
-    long httpCode = 0;
-    std::string err;
-    bool ok = httpPostJsonStream(url, body,
-                                 (apiKey_.empty() ? std::nullopt : std::optional<std::string>(apiKey_)),
-                                 httpCode, err, st);
-
-    if (!ok) {
-      messages_[currentAssistantIndex_].content = "[request failed: " + err + "]";
+    const int kMaxToolRounds = 800;
+    for (int round = 0; round < kMaxToolRounds; round++) {
+      messages_.push_back({"assistant", ""});
+      currentAssistantIndex_ = messages_.size() - 1;
+      reasoningText_.clear();
+      showReasoning_ = false;
+      responseStarted_ = false;
       render();
-      return;
-    }
 
-    if (httpCode < 200 || httpCode >= 300) {
-      messages_[currentAssistantIndex_].content = "[http " + std::to_string(httpCode) + "]";
+      StreamState st;
+      st.useCallbacks = true;
+      st.onReasoning = [&](const std::string& chunk) { appendReasoning(chunk); };
+      st.onContentStart = [&]() {
+        responseStarted_ = true;
+        clearReasoning();
+        render();
+      };
+      st.onContent = [&](const std::string& chunk) { appendAssistantDelta(chunk); };
+
+      std::string body = buildChatRequestJson(
+          model_,
+          historyMessages_,
+          /*temperature=*/0.7,
+          /*stream=*/true,
+          toolSpecs_.empty() ? nullptr : &toolSpecs_
+      );
+
+      long httpCode = 0;
+      std::string err;
+      bool ok = httpPostJsonStream(url, body,
+                                   (apiKey_.empty() ? std::nullopt : std::optional<std::string>(apiKey_)),
+                                   httpCode, err, st);
+
+      clearReasoning();
+
+      if (!ok) {
+        messages_[currentAssistantIndex_].content = "[request failed: " + err + "]";
+        render();
+        return;
+      }
+
+      if (httpCode < 200 || httpCode >= 300) {
+        messages_[currentAssistantIndex_].content = "[http " + std::to_string(httpCode) + "]";
+        render();
+        return;
+      }
+
+      auto toolCalls = collectToolCallsFromStream(st);
+      historyMessages_.push_back({"assistant", st.assistantAll, toolCalls, ""});
+      if (st.assistantAll.empty() && !toolCalls.empty() && currentAssistantIndex_ < messages_.size()) {
+        auto eraseAt = messages_.begin() + static_cast<std::vector<TuiMessage>::difference_type>(currentAssistantIndex_);
+        messages_.erase(eraseAt);
+        currentAssistantIndex_ = messages_.size();
+      }
+
+      if (toolCalls.empty()) {
+        render();
+        return;
+      }
+
+      for (const auto& call : toolCalls) {
+        ToolRunRecord run = executeToolCall(call, toolSpecs_);
+        messages_.push_back({"tool", buildToolInteractionDisplay(run)});
+        historyMessages_.push_back({"tool", buildToolResultContent(run), {}, run.toolCallId});
+      }
       render();
-      return;
     }
 
-    if (!st.assistantAll.empty()) {
-      history_.push_back({"assistant", st.assistantAll});
-    }
+    messages_.push_back({"assistant", "[aborted: exceeded tool call round limit]"});
+    render();
   }
 };
 
@@ -1170,7 +2070,7 @@ private:
 static int runCli(int argc, char** argv) {
   if (argc < 2) {
     std::cerr << "usage: lm \"prompt\" [more words...]\n"
-              << "          [--file path] [--cmd \"cmd\"] [--model model_id]\n"
+              << "          [--file path] [--cmd \"cmd\"] [--model model_id] [--skills path]\n"
               << "          [--new] [--no-color] [--raw]\n"
               << "          [--tui]\n\n"
               << "env:\n"
@@ -1178,7 +2078,8 @@ static int runCli(int argc, char** argv) {
               << "  LM_MODEL           optional model id\n"
               << "  LM_API_KEY         optional bearer token\n"
               << "  LM_SYSTEM_PROMPT   optional system prompt\n"
-              << "  LM_HISTORY_FILE    optional history file path (default /tmp/lmstudio-cli.history.txt)\n";
+              << "  LM_HISTORY_FILE    optional history file path (default /tmp/lmstudio-cli.history.txt)\n"
+              << "  LM_SKILLS_FILE     optional tools TOML file (default ~/.local/share/lm/skills.toml)\n";
     return 2;
   }
 
@@ -1197,6 +2098,9 @@ static int runCli(int argc, char** argv) {
 
   std::string historyPath = getEnv("LM_HISTORY_FILE");
   if (historyPath.empty()) historyPath = "/tmp/lmstudio-cli.history.txt";
+  std::string skillsPath = getEnv("LM_SKILLS_FILE");
+  if (skillsPath.empty()) skillsPath = "~/.local/share/lm/skills.toml";
+  skillsPath = expandUserPath(skillsPath);
 
   bool forceNoColor = false;
   bool raw = false;
@@ -1241,6 +2145,12 @@ static int runCli(int argc, char** argv) {
       continue;
     }
 
+    if (arg == "--skills") {
+      if (i + 1 >= argc) { std::cerr << "error: --skills expects a path\n"; return 2; }
+      skillsPath = expandUserPath(argv[++i]);
+      continue;
+    }
+
     if (arg == "--no-color") { forceNoColor = true; continue; }
     if (arg == "--raw") { raw = true; continue; }
 
@@ -1257,61 +2167,106 @@ static int runCli(int argc, char** argv) {
     }
   }
 
+  std::vector<std::string> skillWarnings;
+  std::vector<ToolSpec> toolSpecs = loadToolSpecsFromToml(skillsPath, skillWarnings);
+  for (const auto& warning : skillWarnings) {
+    std::cerr << "warning: " << warning << "\n";
+  }
+
   auto history = loadHistory(historyPath);
+  std::vector<ChatMessage> chatMessages;
+  if (systemPrompt && !systemPrompt->empty()) {
+    chatMessages.push_back({"system", *systemPrompt, {}, ""});
+  }
+  for (const auto& [role, content] : history) {
+    if (role == "user" || role == "assistant") {
+      chatMessages.push_back({role, content, {}, ""});
+    }
+  }
+  chatMessages.push_back({"user", prompt, {}, ""});
 
   curl_global_init(CURL_GLOBAL_DEFAULT);
+  auto finish = [&](int rc) {
+    curl_global_cleanup();
+    return rc;
+  };
 
   std::string url = baseUrl + "/chat/completions";
-  std::string body = buildChatRequestJson(
-      model,
-      systemPrompt,
-      history,
-      prompt,
-      /*temperature=*/0.7,
-      /*stream=*/true
-  );
-
   bool stdoutIsTty = isatty(fileno(stdout)) != 0;
+  const std::vector<ToolSpec>* toolsPtr = toolSpecs.empty() ? nullptr : &toolSpecs;
+  const int kMaxToolRounds = 8;
+  bool gotFinalAssistant = false;
+  std::string finalAssistantText;
+  int toolBoxWidth = terminalWidthGuess();
 
-  StreamState st;
-  st.printer.raw = raw;
-  st.printer.enableColor = stdoutIsTty && !forceNoColor && !raw;
-  st.printer.ansi.enable = st.printer.enableColor;
-  st.reasoningWindow.render = stdoutIsTty && !raw;
+  for (int round = 0; round < kMaxToolRounds; round++) {
+    std::string body = buildChatRequestJson(
+        model,
+        chatMessages,
+        /*temperature=*/0.7,
+        /*stream=*/true,
+        toolsPtr
+    );
 
-  long httpCode = 0;
-  std::string err;
-  bool ok = httpPostJsonStream(url, body, (apiKey.empty() ? std::nullopt : std::optional<std::string>(apiKey)),
-                               httpCode, err, st);
+    StreamState st;
+    st.printer.raw = raw;
+    st.printer.enableColor = stdoutIsTty && !forceNoColor && !raw;
+    st.printer.ansi.enable = st.printer.enableColor;
+    st.reasoningWindow.render = stdoutIsTty && !raw;
 
-  curl_global_cleanup();
+    long httpCode = 0;
+    std::string err;
+    bool ok = httpPostJsonStream(
+        url,
+        body,
+        (apiKey.empty() ? std::nullopt : std::optional<std::string>(apiKey)),
+        httpCode,
+        err,
+        st
+    );
 
-  st.reasoningWindow.clearDisplay();
-  st.reasoningWindow.reset();
+    st.reasoningWindow.clearDisplay();
+    st.reasoningWindow.reset();
+    st.printer.finalize();
 
-  st.printer.finalize();
+    if (!ok) {
+      std::cerr << "\nrequest failed: " << err << "\n";
+      return finish(1);
+    }
+    if (httpCode < 200 || httpCode >= 300) {
+      std::cerr << "\nhttp " << httpCode << " response:\n" << st.rawAll << "\n";
+      return finish(1);
+    }
 
-  if (!ok) {
-    std::cerr << "\nrequest failed: " << err << "\n";
-    return 1;
-  }
+    std::vector<ToolCall> toolCalls = collectToolCallsFromStream(st);
+    chatMessages.push_back({"assistant", st.assistantAll, toolCalls, ""});
 
-  if (httpCode < 200 || httpCode >= 300) {
-    std::cerr << "\nhttp " << httpCode << " response:\n" << st.rawAll << "\n";
-    return 1;
-  }
+    if (toolCalls.empty()) {
+      gotFinalAssistant = true;
+      finalAssistantText = st.assistantAll;
+      break;
+    }
 
-  // Ensure we end with a newline (nice CLI behavior)
-  if (!st.assistantAll.empty() && st.assistantAll.back() != '\n') std::cout << "\n";
-
-  // Save turn to history (only if we got something back)
-  if (!st.assistantAll.empty()) {
-    if (!appendTurn(historyPath, prompt, st.assistantAll)) {
-      std::cerr << "warning: failed to append to history file: " << historyPath << "\n";
+    if (!st.assistantAll.empty() && st.assistantAll.back() != '\n') std::cout << "\n";
+    for (const auto& call : toolCalls) {
+      ToolRunRecord run = executeToolCall(call, toolSpecs);
+      printBorderedBlockStdout(buildToolInteractionDisplay(run), toolBoxWidth);
+      chatMessages.push_back({"tool", buildToolResultContent(run), {}, run.toolCallId});
     }
   }
 
-  return 0;
+  if (!gotFinalAssistant) {
+    std::cerr << "\nrequest failed: exceeded tool call round limit\n";
+    return finish(1);
+  }
+
+  if (!finalAssistantText.empty() && finalAssistantText.back() != '\n') std::cout << "\n";
+  if (!finalAssistantText.empty()) {
+    if (!appendTurn(historyPath, prompt, finalAssistantText)) {
+      std::cerr << "warning: failed to append to history file: " << historyPath << "\n";
+    }
+  }
+  return finish(0);
 }
 
 static int runTui(int argc, char** argv) {
@@ -1327,6 +2282,9 @@ static int runTui(int argc, char** argv) {
   std::string systemPromptEnv = getEnv("LM_SYSTEM_PROMPT");
   std::optional<std::string> systemPrompt = systemPromptEnv.empty() ? std::nullopt
                                                                     : std::optional<std::string>(systemPromptEnv);
+  std::string skillsPath = getEnv("LM_SKILLS_FILE");
+  if (skillsPath.empty()) skillsPath = "~/.local/share/lm/skills.toml";
+  skillsPath = expandUserPath(skillsPath);
 
   for (int i = 1; i < argc; i++) {
     std::string arg = argv[i];
@@ -1334,6 +2292,11 @@ static int runTui(int argc, char** argv) {
     if (arg == "--model") {
       if (i + 1 >= argc) { std::cerr << "error: --model expects a model id\n"; return 2; }
       model = argv[++i];
+      continue;
+    }
+    if (arg == "--skills") {
+      if (i + 1 >= argc) { std::cerr << "error: --skills expects a path\n"; return 2; }
+      skillsPath = expandUserPath(argv[++i]);
       continue;
     }
     if (arg == "--no-color" || arg == "--raw" || arg == "--file" || arg == "--cmd" || arg == "--new") {
@@ -1350,8 +2313,14 @@ static int runTui(int argc, char** argv) {
 
   if (model.empty()) model = "local-model";
 
+  std::vector<std::string> skillWarnings;
+  std::vector<ToolSpec> toolSpecs = loadToolSpecsFromToml(skillsPath, skillWarnings);
+  for (const auto& warning : skillWarnings) {
+    std::cerr << "warning: " << warning << "\n";
+  }
+
   curl_global_init(CURL_GLOBAL_DEFAULT);
-  TuiApp app(baseUrl, model, apiKey, systemPrompt);
+  TuiApp app(baseUrl, model, apiKey, systemPrompt, toolSpecs);
   int rc = app.run();
   curl_global_cleanup();
   return rc;

@@ -1,0 +1,22 @@
+[[tools]]
+name = "listFilesRecursive"
+command = "find . -mindepth 1 -print | sort"
+description = "List all files and directories recursively from the current working directory. Use this first to discover project structure before reading files."
+
+[[tools]]
+name = "readFile"
+command = "awk -v s=$start -v c=$count 'NR >= s && NR < s + c { print }' $path"
+description = "Read a chunk of lines from a file. Provide a 1-based start line and a line count."
+
+[tools.inputs]
+path = "Path to the file to read, relative to the current working directory or absolute"
+start = "1-based starting line number"
+count = "Number of lines to return"
+
+[[tools]]
+name = "numLines"
+command = "awk 'END { print NR }' $path"
+description = "Return the total number of lines in a file."
+
+[tools.inputs]
+path = "Path to the file to count, relative to the current working directory or absolute"

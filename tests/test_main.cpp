@@ -34,6 +34,21 @@ static void testExtractStreamDeltaReasoning() {
   expectEq(out.value_or(""), "step 1", "extractStreamDeltaReasoning value");
 }
 
+static void testExtractStreamDeltaToolCalls() {
+  std::string payload =
+      "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\","
+      "\"function\":{\"name\":\"listFiles\",\"arguments\":\"{\\\"path\\\":\\\"src\\\"}\"}}]},\"index\":0,"
+      "\"finish_reason\":null}]}";
+  auto calls = extractStreamDeltaToolCalls(payload);
+  expectTrue(calls.size() == 1, "extractStreamDeltaToolCalls size 1");
+  if (calls.size() == 1) {
+    expectTrue(calls[0].index == 0, "extractStreamDeltaToolCalls index");
+    expectEq(calls[0].id.value_or(""), "call_1", "extractStreamDeltaToolCalls id");
+    expectEq(calls[0].name.value_or(""), "listFiles", "extractStreamDeltaToolCalls name");
+    expectEq(calls[0].argumentsChunk.value_or(""), "{\"path\":\"src\"}", "extractStreamDeltaToolCalls args");
+  }
+}
+
 static void testReasoningWindowWrap() {
   ReasoningWindow w(5, 3);
   w.append("abcd");
@@ -75,6 +90,62 @@ static void testBuildChatRequestJson() {
   expectTrue(body.find("\"stream\":true") != std::string::npos, "request includes stream");
 }
 
+static void testBuildChatRequestJsonWithTools() {
+  std::vector<ToolSpec> tools = {
+      {"runShell", "grep $pattern $path", "search file text", {{"pattern", "Text to search"}, {"path", "File path"}}}
+  };
+  std::vector<std::pair<std::string, std::string>> history;
+  auto body = buildChatRequestJson("m", std::nullopt, history, "next", 0.5, true, &tools);
+  expectTrue(body.find("\"tools\":[") != std::string::npos, "request includes tools");
+  expectTrue(body.find("\"name\":\"runShell\"") != std::string::npos, "request includes tool name");
+  expectTrue(body.find("\"pattern\"") != std::string::npos, "request includes variable");
+  expectTrue(body.find("\"tool_choice\":\"auto\"") != std::string::npos, "request includes tool_choice");
+}
+
+static void testRenderToolCommand() {
+  std::map<std::string, std::string> args = {
+      {"path", "src/main.cpp"},
+      {"pattern", "hello world"}
+  };
+  std::string rendered = renderToolCommand("grep $pattern $path", args);
+  expectEq(rendered, "grep 'hello world' 'src/main.cpp'", "renderToolCommand quotes and replaces");
+}
+
+static void testParseToolArgumentsObject() {
+  auto args = parseToolArgumentsObject("{\"a\":\"x\",\"b\":12,\"c\":true}");
+  expectTrue(args.has_value(), "parseToolArgumentsObject has value");
+  if (args) {
+    expectEq(args->at("a"), "x", "parseToolArgumentsObject string");
+    expectEq(args->at("b"), "12", "parseToolArgumentsObject number");
+    expectEq(args->at("c"), "true", "parseToolArgumentsObject bool");
+  }
+}
+
+static void testLoadToolSpecsFromToml() {
+  std::filesystem::path tmp = std::filesystem::temp_directory_path() / "lm_cli_test_tools.toml";
+  std::ofstream f(tmp);
+  f << "[[tools]]\n";
+  f << "name = \"grepFile\"\n";
+  f << "command = \"grep $pattern $path\"\n";
+  f << "description = \"Search text\"\n";
+  f << "[tools.inputs]\n";
+  f << "pattern = \"Search pattern\"\n";
+  f << "path = \"Target path\"\n";
+  f.close();
+
+  std::vector<std::string> warnings;
+  auto tools = loadToolSpecsFromToml(tmp.string(), warnings);
+  expectTrue(warnings.empty(), "loadToolSpecsFromToml warnings empty");
+  expectTrue(tools.size() == 1, "loadToolSpecsFromToml one tool");
+  if (tools.size() == 1) {
+    expectEq(tools[0].name, "grepFile", "loadToolSpecsFromToml name");
+    expectEq(tools[0].command, "grep $pattern $path", "loadToolSpecsFromToml command");
+    expectEq(tools[0].description, "Search text", "loadToolSpecsFromToml description");
+    expectTrue(tools[0].inputs.size() == 2, "loadToolSpecsFromToml inputs");
+  }
+  std::filesystem::remove(tmp);
+}
+
 static void testHistoryRoundTrip() {
   std::filesystem::path tmp = std::filesystem::temp_directory_path() / "lm_cli_test_history.txt";
   std::filesystem::remove(tmp);
@@ -106,8 +177,13 @@ static void testJsonEscape() {
 int main() {
   testExtractStreamDeltaContent();
   testExtractStreamDeltaReasoning();
+  testExtractStreamDeltaToolCalls();
   testReasoningWindowWrap();
   testBuildChatRequestJson();
+  testBuildChatRequestJsonWithTools();
+  testRenderToolCommand();
+  testParseToolArgumentsObject();
+  testLoadToolSpecsFromToml();
   testHistoryRoundTrip();
   testTrimTrailingSlash();
   testJsonEscape();
