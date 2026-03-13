@@ -1308,28 +1308,6 @@ static std::string buildChatRequestJson(
   return oss.str();
 }
 
-static std::string buildChatRequestJson(
-    const std::string& model,
-    const std::optional<std::string>& systemPrompt,
-    const std::vector<std::pair<std::string, std::string>>& history,
-    const std::string& userPrompt,
-    double temperature,
-    bool stream,
-    const std::vector<ToolSpec>* tools = nullptr
-) {
-  std::vector<ChatMessage> messages;
-  if (systemPrompt && !systemPrompt->empty()) {
-    messages.push_back({"system", *systemPrompt, {}, ""});
-  }
-  for (const auto& [role, content] : history) {
-    if (role == "user" || role == "assistant") {
-      messages.push_back({role, content, {}, ""});
-    }
-  }
-  messages.push_back({"user", userPrompt, {}, ""});
-  return buildChatRequestJson(model, messages, temperature, stream, tools);
-}
-
 // ------------------------- curl streaming (SSE) -------------------------
 
 struct StreamState {
@@ -1758,12 +1736,27 @@ struct TuiRenderLine {
   int colorPair{0};
 };
 
+static constexpr int kKeyPasteStart = KEY_MAX + 1;
+static constexpr int kKeyPasteEnd = KEY_MAX + 2;
+static constexpr int kKeyShiftEnter = KEY_MAX + 3;
+
+static bool isTuiInsertNewlineKey(int ch) {
+  if (ch == kKeyShiftEnter
+#ifdef KEY_SENTER
+      || ch == KEY_SENTER
+#endif
+      || ch == '\n') {
+    return true;
+  }
+  return false;
+}
+
+static bool isTuiSubmitKey(int ch) {
+  return ch == '\r' || ch == KEY_ENTER;
+}
+
 class TuiApp {
 public:
-  static constexpr int kKeyPasteStart = KEY_MAX + 1;
-  static constexpr int kKeyPasteEnd = KEY_MAX + 2;
-  static constexpr int kKeyShiftEnter = KEY_MAX + 3;
-
   TuiApp(std::string baseUrl,
          std::string model,
          std::string apiKey,
@@ -1782,6 +1775,7 @@ public:
   int run() {
     setlocale(LC_ALL, "");
     initscr();
+    nonl(); // Keep Enter distinct from Ctrl+J so both bindings work.
     cbreak();
     noecho();
     keypad(stdscr, TRUE);
@@ -1829,15 +1823,11 @@ public:
         inBracketedPaste_ = true;
         continue;
       }
-      if (ch == kKeyShiftEnter
-#ifdef KEY_SENTER
-          || ch == KEY_SENTER
-#endif
-      || ch == 22) {
+      if (isTuiInsertNewlineKey(ch)) {
         input_.push_back('\n');
         continue;
       }
-      if (ch == '\n' || ch == KEY_ENTER) {
+      if (isTuiSubmitKey(ch)) {
         if (!input_.empty()) {
           std::string prompt = input_;
           input_.clear();
@@ -1882,7 +1872,7 @@ private:
   static constexpr int kColorReasoning = 3;
   static constexpr int kColorTool = 4;
   static constexpr const char* kHelpText =
-      "PgUp/PgDn scroll | Enter send | Shift+Enter/Ctrl+V newline | Ctrl+C quit | /clear clears";
+      "PgUp/PgDn scroll | Enter send | Shift+Enter/Ctrl+J newline | Ctrl+C quit | /clear clears";
 
   std::string baseUrl_;
   std::string model_;
@@ -1912,6 +1902,8 @@ private:
     define_key("\x1b[201~", kKeyPasteEnd);
     define_key("\x1b[27;2;13~", kKeyShiftEnter);
     define_key("\x1b[13;2u", kKeyShiftEnter);
+    define_key("\x1b[27;2;10~", kKeyShiftEnter);
+    define_key("\x1b[10;2u", kKeyShiftEnter);
   }
 
   void appendInputChar(int ch, bool fromPaste) {

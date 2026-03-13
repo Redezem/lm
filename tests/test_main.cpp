@@ -73,11 +73,13 @@ static void testReasoningWindowWrap() {
 }
 
 static void testBuildChatRequestJson() {
-  std::vector<std::pair<std::string, std::string>> history = {
-      {"user", "hi"},
-      {"assistant", "yo"}
+  std::vector<ChatMessage> messages = {
+      {"system", "sys", {}, ""},
+      {"user", "hi", {}, ""},
+      {"assistant", "yo", {}, ""},
+      {"user", "next", {}, ""}
   };
-  auto body = buildChatRequestJson("m", std::string("sys"), history, "next", 0.5, true);
+  auto body = buildChatRequestJson("m", messages, 0.5, true, nullptr);
   expectTrue(body.find("\"model\":\"m\"") != std::string::npos, "request includes model");
   expectTrue(body.find("\"role\":\"system\"") != std::string::npos, "request includes system role");
   expectTrue(body.find("\"content\":\"sys\"") != std::string::npos, "request includes system content");
@@ -94,8 +96,10 @@ static void testBuildChatRequestJsonWithTools() {
   std::vector<ToolSpec> tools = {
       {"runShell", "grep $pattern $path", "search file text", {{"pattern", "Text to search"}, {"path", "File path"}}}
   };
-  std::vector<std::pair<std::string, std::string>> history;
-  auto body = buildChatRequestJson("m", std::nullopt, history, "next", 0.5, true, &tools);
+  std::vector<ChatMessage> messages = {
+      {"user", "next", {}, ""}
+  };
+  auto body = buildChatRequestJson("m", messages, 0.5, true, &tools);
   expectTrue(body.find("\"tools\":[") != std::string::npos, "request includes tools");
   expectTrue(body.find("\"name\":\"runShell\"") != std::string::npos, "request includes tool name");
   expectTrue(body.find("\"pattern\"") != std::string::npos, "request includes variable");
@@ -184,6 +188,18 @@ static void testBuildInputDisplay() {
   expectEq(buildInputDisplay("a\r\nb"), "> a\n  b", "input display normalizes pasted CRLF");
 }
 
+static void testTuiKeyBindings() {
+  expectTrue(isTuiInsertNewlineKey('\n'), "Ctrl+J inserts newline");
+  expectTrue(isTuiInsertNewlineKey(kKeyShiftEnter), "Shift+Enter inserts newline");
+#ifdef KEY_SENTER
+  expectTrue(isTuiInsertNewlineKey(KEY_SENTER), "KEY_SENTER inserts newline");
+#endif
+  expectTrue(!isTuiInsertNewlineKey('\r'), "Enter does not insert newline");
+  expectTrue(isTuiSubmitKey('\r'), "carriage return submits");
+  expectTrue(isTuiSubmitKey(KEY_ENTER), "KEY_ENTER submits");
+  expectTrue(!isTuiSubmitKey('\n'), "Ctrl+J does not submit");
+}
+
 int main() {
   testExtractStreamDeltaContent();
   testExtractStreamDeltaReasoning();
@@ -199,6 +215,7 @@ int main() {
   testJsonEscape();
   testNormalizeNewlines();
   testBuildInputDisplay();
+  testTuiKeyBindings();
 
   if (g_failures == 0) {
     std::cout << "ok\n";

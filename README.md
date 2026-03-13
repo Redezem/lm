@@ -44,13 +44,14 @@ Notes:
 TUI keys:
 - `Enter` send prompt
 - `Shift+Enter` inserts a newline on terminals that expose it distinctly
-- `Ctrl+V` inserts a newline fallback
+- `Ctrl+J` inserts a newline fallback without colliding with terminal quote-next behavior
 - `PgUp/PgDn` scroll
 - `Ctrl+C` quit
 - `/clear` clears the current conversation
 
 Notes:
 - TUI history is in-memory only and discarded on exit.
+- The TUI enables `nonl()` so `Enter` can submit while `Ctrl+J` inserts a literal line feed.
 - Bracketed paste is enabled in the TUI, so pasted multi-line text stays in the current prompt instead of sending line-by-line.
 - Reasoning output (if present) shows as a blue, labeled block where the assistant reply will appear.
 - Tool input/output is shown inline as bordered blocks in the chat area.
