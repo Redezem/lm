@@ -1,2 +1,13 @@
 lm
 lm_test
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+build/
+dist/
+out/
+.mise/
+.mise.local.toml
