@@ -1,3 +1,12 @@
+ # Top-Level Directives
+	- 1. Keep every Markdown document in this repository current at the end of each task.
+	- 2. Maintain this file as the primary contributor guide for future code agents.
+	- 3. Preserve the changelog below as append-only and date-stamped.
+	- 4. Rewrite the handoff section completely after every task so the next agent starts from current reality.
+	- 5. Ensure `.gitignore` excludes build artefacts, packaging output, and local-only tool state.
+	- 6. Remove build artefacts before returning control to the user.
+	- 7. Use `mise` to manage the build environment.
+
 # Repository Guidelines
 
 ## Project Structure & Module Organization
