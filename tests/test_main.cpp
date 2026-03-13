@@ -174,6 +174,16 @@ static void testJsonEscape() {
   expectEq(jsonEscape("a\"b\n"), "a\\\"b\\n", "json escape quotes/newline");
 }
 
+static void testNormalizeNewlines() {
+  expectEq(normalizeNewlines("a\r\nb\rc"), "a\nb\nc", "normalize CRLF and CR");
+  expectEq(normalizeNewlines("plain"), "plain", "normalize leaves plain text");
+}
+
+static void testBuildInputDisplay() {
+  expectEq(buildInputDisplay("line 1\nline 2"), "> line 1\n  line 2", "input display indents continuation");
+  expectEq(buildInputDisplay("a\r\nb"), "> a\n  b", "input display normalizes pasted CRLF");
+}
+
 int main() {
   testExtractStreamDeltaContent();
   testExtractStreamDeltaReasoning();
@@ -187,6 +197,8 @@ int main() {
   testHistoryRoundTrip();
   testTrimTrailingSlash();
   testJsonEscape();
+  testNormalizeNewlines();
+  testBuildInputDisplay();
 
   if (g_failures == 0) {
     std::cout << "ok\n";

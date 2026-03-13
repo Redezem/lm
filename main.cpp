@@ -1723,6 +1723,31 @@ static std::vector<std::string> wrapTextChars(const std::string& text, int width
   return lines;
 }
 
+static std::string normalizeNewlines(const std::string& text) {
+  std::string out;
+  out.reserve(text.size());
+  for (size_t i = 0; i < text.size(); i++) {
+    char c = text[i];
+    if (c == '\r') {
+      out.push_back('\n');
+      if (i + 1 < text.size() && text[i + 1] == '\n') i++;
+      continue;
+    }
+    out.push_back(c);
+  }
+  return out;
+}
+
+static std::string buildInputDisplay(const std::string& input) {
+  std::string normalized = normalizeNewlines(input);
+  std::string out = "> ";
+  for (char c : normalized) {
+    out.push_back(c);
+    if (c == '\n') out += "  ";
+  }
+  return out;
+}
+
 struct TuiMessage {
   std::string role;
   std::string content;
@@ -1735,6 +1760,10 @@ struct TuiRenderLine {
 
 class TuiApp {
 public:
+  static constexpr int kKeyPasteStart = KEY_MAX + 1;
+  static constexpr int kKeyPasteEnd = KEY_MAX + 2;
+  static constexpr int kKeyShiftEnter = KEY_MAX + 3;
+
   TuiApp(std::string baseUrl,
          std::string model,
          std::string apiKey,
@@ -1765,11 +1794,22 @@ public:
       init_pair(kColorReasoning, COLOR_BLUE, -1);
       init_pair(kColorTool, COLOR_CYAN, -1);
     }
+    configureInputSequences();
+    setBracketedPasteMode(true);
 
     bool running = true;
     while (running) {
       render();
       int ch = getch();
+      if (inBracketedPaste_) {
+        if (ch == kKeyPasteEnd) {
+          inBracketedPaste_ = false;
+          sawPasteCarriageReturn_ = false;
+          continue;
+        }
+        appendInputChar(ch, true);
+        continue;
+      }
       if (ch == 3) { // Ctrl+C
         running = false;
         continue;
@@ -1785,6 +1825,18 @@ public:
       if (ch == KEY_RESIZE) {
         continue;
       }
+      if (ch == kKeyPasteStart) {
+        inBracketedPaste_ = true;
+        continue;
+      }
+      if (ch == kKeyShiftEnter
+#ifdef KEY_SENTER
+          || ch == KEY_SENTER
+#endif
+      || ch == 22) {
+        input_.push_back('\n');
+        continue;
+      }
       if (ch == '\n' || ch == KEY_ENTER) {
         if (!input_.empty()) {
           std::string prompt = input_;
@@ -1797,11 +1849,10 @@ public:
         if (!input_.empty()) input_.pop_back();
         continue;
       }
-      if (std::isprint(ch)) {
-        input_.push_back(static_cast<char>(ch));
-      }
+      appendInputChar(ch, false);
     }
 
+    setBracketedPasteMode(false);
     endwin();
     return 0;
   }
@@ -1831,7 +1882,7 @@ private:
   static constexpr int kColorReasoning = 3;
   static constexpr int kColorTool = 4;
   static constexpr const char* kHelpText =
-      "PgUp/PgDn scroll | Enter send | Ctrl+C quit | /clear clears";
+      "PgUp/PgDn scroll | Enter send | Shift+Enter/Ctrl+V newline | Ctrl+C quit | /clear clears";
 
   std::string baseUrl_;
   std::string model_;
@@ -1848,6 +1899,50 @@ private:
   int scrollTop_{0};
   int lastChatHeight_{1};
   bool stickToBottom_{true};
+  bool inBracketedPaste_{false};
+  bool sawPasteCarriageReturn_{false};
+
+  static void setBracketedPasteMode(bool enabled) {
+    std::fputs(enabled ? "\x1b[?2004h" : "\x1b[?2004l", stdout);
+    std::fflush(stdout);
+  }
+
+  static void configureInputSequences() {
+    define_key("\x1b[200~", kKeyPasteStart);
+    define_key("\x1b[201~", kKeyPasteEnd);
+    define_key("\x1b[27;2;13~", kKeyShiftEnter);
+    define_key("\x1b[13;2u", kKeyShiftEnter);
+  }
+
+  void appendInputChar(int ch, bool fromPaste) {
+    if (fromPaste) {
+      if (ch == '\r') {
+        input_.push_back('\n');
+        sawPasteCarriageReturn_ = true;
+        return;
+      }
+      if (ch == '\n') {
+        if (sawPasteCarriageReturn_) {
+          sawPasteCarriageReturn_ = false;
+          return;
+        }
+        input_.push_back('\n');
+        return;
+      }
+      if (ch == KEY_ENTER) {
+        input_.push_back('\n');
+        return;
+      }
+      sawPasteCarriageReturn_ = false;
+    }
+    if (ch == '\t') {
+      input_.push_back('\t');
+      return;
+    }
+    if (ch >= 0 && ch <= 255 && std::isprint(static_cast<unsigned char>(ch))) {
+      input_.push_back(static_cast<char>(ch));
+    }
+  }
 
   void scrollBy(int delta) {
     stickToBottom_ = false;
@@ -1900,7 +1995,7 @@ private:
     getmaxyx(stdscr, h, w);
     if (h <= 0 || w <= 0) return;
 
-    std::string inputDisplay = "> " + input_;
+    std::string inputDisplay = buildInputDisplay(input_);
     auto inputLines = wrapTextChars(inputDisplay, w);
     int inputHeight = std::max(1, (int)inputLines.size());
     if (inputHeight >= h) {
