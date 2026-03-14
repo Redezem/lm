@@ -6,4 +6,4 @@ test:
 	./lm_test
 
 clean:
-	rm lm lm_test
+	rm -f lm lm_test
