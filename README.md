@@ -1,3 +1,5 @@
+![lm-cli hero image](assets/lm_hero.png)
+
 # lm-cli
 
 Minimal C++ client for OpenAI-compatible `/chat/completions` endpoints, with a streaming CLI, an ncurses TUI, and optional tool execution from a local TOML file.

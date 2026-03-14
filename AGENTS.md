@@ -46,6 +46,7 @@ This project assumes `libcurl` headers and libraries are available (see `-I/usr/
 - Document any new environment variables or flags in `README.md` and in the PR description.
 
 ## Changelog
+- 2026-03-14: Added `assets/lm_hero.png` as the top hero image in `README.md`, verified the existing `.gitignore` already covers build outputs and local `mise` state, and left the repo without generated binaries.
 - 2026-03-14: Audited the working tree and all 12 commits for committed secrets and opsec leaks, installed `gitleaks` via `mise x go@latest` outside the repo, found no committed credentials, documented the default `/tmp` history file and trusted-`skills.toml` shell-execution caveats in `README.md`/`AGENTS.md`, and confirmed no generated build artifacts remained in the tree.
 - 2026-03-14: Reviewed `README.md` against `main.cpp`, corrected the documented CLI/TUI flag surface, required environment/defaults, tool-config parser limitations, history persistence behavior, and tool-round limits, hardened `make clean` to tolerate missing binaries, re-ran `mise exec -- make test`, and removed generated binaries.
 - 2026-03-13: Switched the TUI multiline bindings from `Ctrl+V` to `Ctrl+J`, separated submit vs newline handling with `nonl()`, expanded `Shift+Enter` escape-sequence coverage, added key-binding regression tests, and refreshed repo docs/ignore rules.
@@ -53,6 +54,6 @@ This project assumes `libcurl` headers and libraries are available (see `-I/usr/
 - 2026-03-13: Removed the unused legacy `buildChatRequestJson` overload from `main.cpp`, updated the test harness to call the live `ChatMessage` overload directly, verified a clean `mise exec -- make lm` build no longer emits the unused-function warning, and re-ran `mise exec -- make test`.
 
 ## Handoff
-- `README.md` now matches the current implementation in `main.cpp`: CLI mode requires a prompt, defaults `LM_MODEL` to `local-model`, appends unflagged extra args to the prompt, documents how `--file`/`--cmd` inject content, notes CLI history persistence semantics, and records the actual TUI-only/CLI-only option split.
-- The tools section now documents the real parser constraints: only basic quoted TOML strings are accepted, `[[tools]]` and `[[tool]]` are both supported, command template variables become required schema fields, and commands run through `sh -lc` with inherited environment variables.
-- Run `mise exec -- make test` after behavior changes that could affect shared helpers, then `make clean` before handing control back; `clean` now uses `rm -f` so it succeeds even if only one binary was built. `.gitignore` already covers `lm`, `lm_test`, common build output directories, and local `mise` state.
+- `README.md` now opens with a Markdown hero image that points at `assets/lm_hero.png`, followed by the existing `# lm-cli` title and the previously corrected usage/configuration documentation.
+- The repository already has a `.gitignore` that excludes `lm`, `lm_test`, object/library artefacts, common build output directories, and local `mise` state, so no ignore-rule changes were needed for this task.
+- This task was docs-only, so no build or test run was necessary; there are no generated binaries in the tree. The `assets/` directory is present in the workspace and currently untracked in git, with `README.md` now depending on `assets/lm_hero.png` for the hero image.
